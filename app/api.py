@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .engine import MAX_CHANGES, MAX_RECORDS, ReplayError, replay
+from .engine import MAX_CHANGES, MAX_CHECKS, MAX_RECORDS, ReplayError, replay
 
 logger = logging.getLogger("ixfr")
 
@@ -30,7 +30,11 @@ async def healthz() -> dict[str, str]:
 
 @app.get("/api/dns/ixfr/limits")
 async def limits() -> dict[str, int]:
-    return {"max_changes": MAX_CHANGES, "max_records": MAX_RECORDS}
+    return {
+        "max_changes": MAX_CHANGES,
+        "max_records": MAX_RECORDS,
+        "max_checks": MAX_CHECKS,
+    }
 
 
 @app.post("/api/dns/ixfr/replay")

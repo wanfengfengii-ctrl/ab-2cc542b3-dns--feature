@@ -14,6 +14,9 @@ change-located error code and **no partial snapshot is ever returned**.
   "start": [ <RR>, ... ],
   "changes": [
     { "deletes": [ <RR>, ... ], "adds": [ <RR>, ... ] }
+  ],
+  "continuityChecks": [
+    { "id": "web", "name": "www.example.com", "requiredTypes": ["A", "AAAA"] }
   ]
 }
 ```
@@ -22,6 +25,9 @@ change-located error code and **no partial snapshot is ever returned**.
   contain exactly one SOA.
 * `changes`: **1–64** ordered changes; total records across the request
   (start + every delete/add) must not exceed **5000**.
+* `continuityChecks` *(optional)*: **1–32** checks, each with a unique `id`,
+  an in-zone `name`, and a non-empty `requiredTypes` subset of `A`/`AAAA`.
+  When omitted, the request/response contract is unchanged.
 
 Record shape:
 
@@ -49,6 +55,55 @@ Record shape:
 7. The apex always holds **exactly one SOA**; SOAs never move off the apex.
 8. Zone and record names are **case-insensitively normalized** (canonical
    lowercase; a single trailing dot is accepted as absolute form).
+
+## Continuity checks
+
+Critical hosts must stay resolvable at **every** version of an incremental
+rollout — a final snapshot that resolves is not enough if an intermediate
+version briefly goes dark. With `continuityChecks` present, each check is
+re-resolved at the starting snapshot and after every fully applied change:
+
+1. From the normalized check `name`, follow the unique CNAME chain (the
+   engine guarantees at most one CNAME target per owner).
+2. The chain terminal must still be **inside the zone**.
+3. The terminal must hold **every** required address type (`A`/`AAAA`).
+
+CNAME loops, broken chains (dangling targets or a deleted checked name),
+out-of-zone endpoints, and missing address families all reject the entire
+replay — no records, digest, or partial replay result is returned:
+
+```json
+{
+  "error": {
+    "code": "CONTINUITY_CHECK_FAILED",
+    "rule": "missing_required_type",
+    "check": "web",
+    "change": 2,
+    "message": "check 'web': chain terminal example.com has no A record"
+  }
+}
+```
+
+`change` is the 1-based change whose snapshot broke the check (`0` = the
+starting zone); `rule` is one of `cname_chain_loop`, `cname_chain_broken`,
+`chain_terminal_outside_zone`, `missing_required_type`.
+
+On success the response gains a `continuity` array — in check input order —
+with the final canonical chain terminal and each required address family's
+stably sorted addresses. Record ordering, digest, and serial results are
+identical to an unchecked replay of the same log:
+
+```json
+{
+  "continuity": [
+    {
+      "id": "web",
+      "terminal": "example.com",
+      "addresses": { "A": ["192.0.2.1"], "AAAA": ["2001:db8::1"] }
+    }
+  ]
+}
+```
 
 ## Response
 
@@ -98,6 +153,7 @@ offending entry within that change's delete/add sequence (0-based).
 | `TTL_MISMATCH` | RRset members carry different TTLs |
 | `CNAME_CONFLICT` | CNAME coexists with other data |
 | `NAME_OUTSIDE_ZONE` | Record owner is outside the zone apex |
+| `CONTINUITY_CHECK_FAILED` | A continuity check broke at the start or an intermediate snapshot (carries `check` id and `change`) |
 
 ## Running with Docker
 

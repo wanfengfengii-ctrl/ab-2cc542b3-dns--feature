@@ -17,6 +17,14 @@ Rules implemented:
 * The apex always holds exactly one SOA.
 * A failing change — and therefore the whole replay — never produces a partial
   snapshot: each change is applied to a private copy first.
+
+Optional ``continuityChecks`` pin critical names across the whole rollout:
+each check is re-resolved at the starting snapshot and after every committed
+change, following the (unique) CNAME chain from its normalized name to the
+chain terminal. The terminal must stay inside the zone and keep every
+required address type (``A``/``AAAA``); loops, dangling targets, out-of-zone
+endpoints and missing address families reject the whole replay with
+``CONTINUITY_CHECK_FAILED`` and no partial result.
 """
 
 from __future__ import annotations
@@ -33,9 +41,11 @@ SERIAL_HALF = 1 << 31
 MAX_TTL = (1 << 31) - 1
 MAX_RECORDS = 5000
 MAX_CHANGES = 64
+MAX_CHECKS = 32
 
 RTYPES = ("SOA", "A", "AAAA", "CNAME", "TXT")
 RTYPE_ORDER = {rtype: index for index, rtype in enumerate(RTYPES)}
+ADDRESS_TYPES = ("A", "AAAA")
 
 _LABEL_RE = re.compile(r"^(?:\*|[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?)$")
 
@@ -52,6 +62,7 @@ class ReplayError(Exception):
         *,
         record: int | None = None,
         field: str | None = None,
+        check: str | None = None,
     ) -> None:
         super().__init__(message or rule)
         self.code = code
@@ -60,6 +71,7 @@ class ReplayError(Exception):
         self.message = message or rule
         self.record = record
         self.field = field
+        self.check = check
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -72,6 +84,8 @@ class ReplayError(Exception):
             payload["record"] = self.record
         if self.field is not None:
             payload["field"] = self.field
+        if self.check is not None:
+            payload["check"] = self.check
         return payload
 
 
@@ -90,6 +104,19 @@ class Record:
 
     def identity(self) -> tuple[Any, ...]:
         return (self.name, self.rtype, self.ttl, *self.rdata)
+
+
+@dataclass
+class ContinuityCheck:
+    """A resolution invariant re-verified at every snapshot of the replay.
+
+    ``required`` holds the address types the chain terminal must keep, in
+    canonical ``ADDRESS_TYPES`` order and free of duplicates.
+    """
+
+    check_id: str
+    name: str
+    required: tuple[str, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +351,197 @@ def _name_in_zone(name: str, apex: str) -> bool:
     return name == apex or name.endswith("." + apex)
 
 
+def _parse_continuity_checks(payload: dict[str, Any]) -> list[ContinuityCheck] | None:
+    """Validate the optional ``continuityChecks`` envelope.
+
+    Returns ``None`` when the field is omitted (the legacy contract). Names
+    are normalized like record owners; the in-zone requirement is enforced
+    later, once the apex is known.
+    """
+
+    raw = payload.get("continuityChecks")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ReplayError(
+            "REQUEST_MALFORMED",
+            "continuity_checks_must_be_array",
+            field="continuityChecks",
+        )
+    if not 1 <= len(raw) <= MAX_CHECKS:
+        raise ReplayError(
+            "REQUEST_MALFORMED",
+            "continuity_checks_count_out_of_range",
+            field="continuityChecks",
+        )
+    checks: list[ContinuityCheck] = []
+    seen_ids: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_must_be_object",
+                field="continuityChecks",
+            )
+        check_id = entry.get("id")
+        if not isinstance(check_id, str) or not check_id:
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_id_must_be_nonempty_string",
+                field="continuityChecks",
+            )
+        if check_id in seen_ids:
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_id_not_unique",
+                field="continuityChecks",
+            )
+        seen_ids.add(check_id)
+        raw_name = entry.get("name")
+        if not isinstance(raw_name, str):
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_name_must_be_string",
+                field="continuityChecks",
+            )
+        try:
+            name = normalize_name(raw_name, 0)
+        except ReplayError:
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_name_invalid",
+                field="continuityChecks",
+            ) from None
+        raw_types = entry.get("requiredTypes")
+        if not isinstance(raw_types, list) or not raw_types:
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "required_types_must_be_nonempty_array",
+                field="continuityChecks",
+            )
+        required: list[str] = []
+        for value in raw_types:
+            if not isinstance(value, str) or value.upper() not in ADDRESS_TYPES:
+                raise ReplayError(
+                    "REQUEST_MALFORMED",
+                    "unsupported_required_type",
+                    field="continuityChecks",
+                )
+            rtype = value.upper()
+            if rtype not in required:
+                required.append(rtype)
+        required.sort(key=ADDRESS_TYPES.index)
+        checks.append(
+            ContinuityCheck(check_id=check_id, name=name, required=tuple(required))
+        )
+    return checks
+
+
+# ---------------------------------------------------------------------------
+# Continuity checks: CNAME-chain resolution at every snapshot
+# ---------------------------------------------------------------------------
+
+
+def _continuity_failure(
+    rule: str, check: ContinuityCheck, change: int, detail: str
+) -> ReplayError:
+    return ReplayError(
+        "CONTINUITY_CHECK_FAILED",
+        rule,
+        change,
+        f"check {check.check_id!r}: {detail}",
+        check=check.check_id,
+    )
+
+
+def _resolve_terminal(
+    zone: dict[tuple[str, str], RRset],
+    names: set[str],
+    apex: str,
+    check: ContinuityCheck,
+    change: int,
+) -> str:
+    """Follow the unique CNAME chain from the check name to its terminal.
+
+    The engine guarantees at most one CNAME rdata per owner name, so the
+    chain is unambiguous. Loops, dangling targets and out-of-zone endpoints
+    are all continuity failures located at ``change`` (0 = starting zone).
+    """
+
+    visited: set[str] = set()
+    name = check.name
+    while True:
+        if name in visited:
+            raise _continuity_failure(
+                "cname_chain_loop", check, change, f"CNAME chain loops at {name}"
+            )
+        visited.add(name)
+        if name not in names:
+            raise _continuity_failure(
+                "cname_chain_broken", check, change, f"{name} has no records"
+            )
+        cname = zone.get((name, "CNAME"))
+        if cname is None:
+            return name
+        target = next(iter(cname.rdatas))[0]
+        if not _name_in_zone(target, apex):
+            raise _continuity_failure(
+                "chain_terminal_outside_zone",
+                check,
+                change,
+                f"CNAME target {target} is outside the zone",
+            )
+        name = target
+
+
+def _evaluate_continuity(
+    zone: dict[tuple[str, str], RRset],
+    apex: str,
+    checks: list[ContinuityCheck],
+    change: int,
+) -> None:
+    """Re-verify every check against one snapshot, in check input order."""
+
+    names = {owner for (owner, _) in zone}
+    for check in checks:
+        terminal = _resolve_terminal(zone, names, apex, check, change)
+        for rtype in check.required:
+            if (terminal, rtype) not in zone:
+                raise _continuity_failure(
+                    "missing_required_type",
+                    check,
+                    change,
+                    f"chain terminal {terminal} has no {rtype} record",
+                )
+
+
+def _continuity_results(
+    zone: dict[tuple[str, str], RRset],
+    apex: str,
+    checks: list[ContinuityCheck],
+    change: int,
+) -> list[dict[str, Any]]:
+    """Resolution outcomes at the final snapshot, in check input order.
+
+    Only called after the final snapshot passed evaluation, so resolution
+    cannot fail here. Addresses are stably sorted per address family, in the
+    same canonical string order as the snapshot records.
+    """
+
+    names = {owner for (owner, _) in zone}
+    results: list[dict[str, Any]] = []
+    for check in checks:
+        terminal = _resolve_terminal(zone, names, apex, check, change)
+        addresses = {
+            rtype: sorted(rdata[0] for rdata in zone[(terminal, rtype)].rdatas)
+            for rtype in check.required
+        }
+        results.append(
+            {"id": check.check_id, "terminal": terminal, "addresses": addresses}
+        )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -345,6 +563,7 @@ def replay(payload: Any) -> dict[str, Any]:
             "changes_count_out_of_range",
             field="changes",
         )
+    checks = _parse_continuity_checks(payload)
 
     total_records = len(start) + sum(
         len(_records_list(change.get("deletes"), index + 1, "deletes"))
@@ -386,6 +605,17 @@ def replay(payload: Any) -> dict[str, Any]:
             raise ReplayError(
                 "NAME_OUTSIDE_ZONE", "record_name_outside_zone", 0, record=index
             )
+
+    if checks is not None:
+        for check in checks:
+            if not _name_in_zone(check.name, apex):
+                raise ReplayError(
+                    "REQUEST_MALFORMED",
+                    "continuity_check_name_outside_zone",
+                    field="continuityChecks",
+                )
+        # The starting snapshot must already satisfy every check.
+        _evaluate_continuity(zone, apex, checks, 0)
 
     current_serial: int = soa_record.rdata[2]
 
@@ -507,8 +737,15 @@ def replay(payload: Any) -> dict[str, Any]:
 
         zone = candidate
         current_serial = _soa_serial(zone, apex)
+        if checks is not None:
+            # Every intermediate snapshot must keep the checked names
+            # resolvable — a transient loss rejects the whole rollout.
+            _evaluate_continuity(zone, apex, checks, change_index)
 
-    return build_snapshot(zone, apex, current_serial, len(changes))
+    result = build_snapshot(zone, apex, current_serial, len(changes))
+    if checks is not None:
+        result["continuity"] = _continuity_results(zone, apex, checks, len(changes))
+    return result
 
 
 def _soa_serial(zone: dict[tuple[str, str], RRset], apex: str) -> int:

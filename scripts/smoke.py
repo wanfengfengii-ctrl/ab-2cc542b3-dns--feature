@@ -7,7 +7,11 @@ It exercises the running API over HTTP only:
 2. a successful replay that crosses the 32-bit serial boundary (wraparound),
 3. deterministic digest and canonical ordering,
 4. an illegal log that must be rejected with a stable, change-located error
-   code and must never leak a partial snapshot.
+   code and must never leak a partial snapshot,
+5. continuity checks: a guarded replay that stays resolvable at every
+   snapshot, and one that briefly loses a required address mid-rollout and
+   must be rejected with the stable continuity error — again with no
+   records, digest or partial replay result.
 
 Exits 0 only when every assertion holds.
 """
@@ -41,6 +45,10 @@ def soa(serial: int) -> dict:
 
 def a(name: str, address: str, ttl: int = 300) -> dict:
     return {"name": name, "type": "A", "ttl": ttl, "address": address}
+
+
+def cname(name: str, target: str, ttl: int = 300) -> dict:
+    return {"name": name, "type": "CNAME", "ttl": ttl, "target": target}
 
 
 def change(serial_from: int, serial_to: int, deletes=None, adds=None) -> dict:
@@ -139,9 +147,66 @@ def main() -> int:
     check("missing delete rejected", status == 422 and error.get("code") == "DELETE_NOT_FOUND", str(body))
     check("missing delete located to record 1", error.get("record") == 1)
 
+    # --- Continuity checks: guarded replay stays resolvable -----------------
+    guarded = {
+        "start": [
+            soa(WRAP - 2),
+            a("example.com", "192.0.2.1"),
+            cname("www.example.com", "example.com"),
+        ],
+        "changes": [
+            change(WRAP - 2, WRAP - 1, adds=[a("example.com", "192.0.2.2")]),
+            change(WRAP - 1, 0),
+        ],
+        "continuityChecks": [
+            {"id": "web", "name": "www.example.com", "requiredTypes": ["A"]},
+        ],
+    }
+    status, body = request("POST", "/api/dns/ixfr/replay", guarded)
+    check("continuity replay returns 200", status == 200, str(body))
+    results = body.get("continuity")
+    check("continuity results present in input order",
+          isinstance(results, list) and [r.get("id") for r in results] == ["web"], str(body))
+    entry = results[0] if isinstance(results, list) and results else {}
+    check("continuity terminal is the canonical chain endpoint",
+          entry.get("terminal") == "example.com", str(entry))
+    check("continuity addresses stably sorted",
+          entry.get("addresses", {}).get("A") == ["192.0.2.1", "192.0.2.2"], str(entry))
+    check("legacy fields intact alongside continuity",
+          body.get("final_serial") == 0 and len(body.get("sha256", "")) == 64, str(body))
+
+    # --- Continuity failure: an intermediate snapshot loses the address -----
+    transient_loss = {
+        "start": [
+            soa(WRAP - 2),
+            a("example.com", "192.0.2.1"),
+            cname("www.example.com", "example.com"),
+        ],
+        "changes": [
+            change(WRAP - 2, WRAP - 1),
+            change(WRAP - 1, 0, deletes=[a("example.com", "192.0.2.1")]),
+            change(0, 1, adds=[a("example.com", "192.0.2.3")]),
+        ],
+        "continuityChecks": [
+            {"id": "web", "name": "www.example.com", "requiredTypes": ["A"]},
+        ],
+    }
+    status, body = request("POST", "/api/dns/ixfr/replay", transient_loss)
+    check("transient resolution loss rejected with 422", status == 422, str(body))
+    error = body.get("error", {})
+    check("stable continuity error code", error.get("code") == "CONTINUITY_CHECK_FAILED", str(error))
+    check("error carries the check id", error.get("check") == "web", str(error))
+    check("error locates the failing change (2)", error.get("change") == 2, str(error))
+    check("error names the failure reason", error.get("rule") == "missing_required_type", str(error))
+    check("no records, digest or partial replay leaked", set(body.keys()) == {"error"}, str(body.keys()))
+
     print("ALL SMOKE CHECKS PASSED")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except urllib.error.URLError as exc:
+        print(f"FAIL: API unreachable at {BASE_URL}: {exc}")
+        sys.exit(1)
