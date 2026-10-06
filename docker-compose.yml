@@ -1,0 +1,35 @@
+services:
+  api:
+    build: .
+    image: ixfr-replay:latest
+    container_name: ixfr-replay-api
+    ports:
+      - "${HOST_PORT:-8080}:8000"
+    environment:
+      # Container-side log level; the published host port comes from HOST_PORT.
+      LOG_LEVEL: info
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # One-shot verification: runs the build check, full test suite and an HTTP
+  # smoke test (including serial wraparound) against the live API, then exits.
+  # Its container exit code is the verdict: 0 = pass, non-zero = failure.
+  verify:
+    image: ixfr-replay:latest
+    build: .
+    entrypoint: ["bash", "scripts/verify.sh"]
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
