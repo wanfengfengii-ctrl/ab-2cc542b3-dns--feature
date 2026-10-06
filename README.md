@@ -14,6 +14,9 @@ change-located error code and **no partial snapshot is ever returned**.
   "start": [ <RR>, ... ],
   "changes": [
     { "deletes": [ <RR>, ... ], "adds": [ <RR>, ... ] }
+  ],
+  "continuityChecks": [
+    { "id": "web", "name": "www.example.com", "requiredTypes": ["A", "AAAA"] }
   ]
 }
 ```
@@ -22,6 +25,10 @@ change-located error code and **no partial snapshot is ever returned**.
   contain exactly one SOA.
 * `changes`: **1–64** ordered changes; total records across the request
   (start + every delete/add) must not exceed **5000**.
+* `continuityChecks` *(optional)*: **1–32** critical hosts that must resolve at
+  the starting snapshot and after **every** complete change. Each entry has a
+  unique non-empty `id`, a zone `name`, and a non-empty `requiredTypes` list
+  limited to `A` / `AAAA`. When omitted, the original contract is unchanged.
 
 Record shape:
 
@@ -50,6 +57,22 @@ Record shape:
 8. Zone and record names are **case-insensitively normalized** (canonical
    lowercase; a single trailing dot is accepted as absolute form).
 
+### Continuity semantics (when `continuityChecks` is present)
+
+For each check, at the starting snapshot and after every complete change, the
+engine walks from the normalized `name` along the **unique CNAME chain** until
+it reaches the terminal owner name, then requires:
+
+* the chain has no **loop**, no **broken/dangling** link, and never leaves the
+  zone (**out-of-zone** terminal),
+* the terminal name lives inside the zone apex, and
+* the terminal holds at least one record of **every** required address family
+  (`A` and/or `AAAA`).
+
+A check failure at the start (`change: 0`) or at any intermediate change
+rejects the whole replay — a log that is correct only in the final snapshot is
+not publishable.
+
 ## Response
 
 `200 OK`
@@ -60,9 +83,24 @@ Record shape:
   "final_serial": 1,
   "changes_applied": 3,
   "records": [ { "name": "...", "type": "...", "ttl": 300, ... } ],
-  "sha256": "<sha-256 of the canonical, stably ordered snapshot>"
+  "sha256": "<sha-256 of the canonical, stably ordered snapshot>",
+  "continuityChecks": [
+    {
+      "id": "web",
+      "canonicalName": "example.com",
+      "addresses": {
+        "A": ["192.0.2.1", "192.0.2.2"],
+        "AAAA": ["2001:db8::1"]
+      }
+    }
+  ]
 }
 ```
+
+The `continuityChecks` array is present only when requested, appears in the
+same order as the request, and reports the final canonical chain terminal plus
+one stably sorted address list per required family. It never alters
+`records`, `sha256`, `final_serial` or `changes_applied`.
 
 `422 Unprocessable Entity` for an unpublishable log:
 
@@ -73,6 +111,26 @@ Record shape:
     "rule": "delete_must_hit_existing_record",
     "change": 1,
     "record": 1,
+    "message": "..."
+  }
+}
+```
+
+For a continuity failure the error additionally carries `check` (the failing
+check id), `reason` (one of `cname_chain_loop`, `cname_chain_broken`,
+`cname_chain_outside_zone`, `cname_target_not_unique`,
+`missing_required_address`) and the failing snapshot in `change` (`0` = start,
+otherwise the 1-based change). No records, digest or partial replay result is
+ever returned.
+
+```json
+{
+  "error": {
+    "code": "CONTINUITY_CHECK_FAILED",
+    "rule": "continuity_check_must_hold_at_every_snapshot",
+    "change": 2,
+    "check": "web",
+    "reason": "missing_required_address",
     "message": "..."
   }
 }
@@ -98,6 +156,7 @@ offending entry within that change's delete/add sequence (0-based).
 | `TTL_MISMATCH` | RRset members carry different TTLs |
 | `CNAME_CONFLICT` | CNAME coexists with other data |
 | `NAME_OUTSIDE_ZONE` | Record owner is outside the zone apex |
+| `CONTINUITY_CHECK_FAILED` | A critical host does not resolve (CNAME loop/broken/out-of-zone chain or missing required address family) at the start (`change: 0`) or after some change; payload includes `check` and `reason` |
 
 ## Running with Docker
 
@@ -110,8 +169,9 @@ curl -s http://localhost:9090/healthz
 ### One-shot verification
 
 The `verify` service runs the build check, the full test suite, and an HTTP
-smoke test against the live API — including a serial-wraparound replay — then
-exits and reports the verdict via its exit code:
+smoke test against the live API — including a serial-wraparound replay and
+continuity-check success/failure scenarios — then exits and reports the
+verdict via its exit code:
 
 ```bash
 docker compose up --build verify

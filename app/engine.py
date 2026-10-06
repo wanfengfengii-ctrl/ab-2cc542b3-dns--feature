@@ -15,6 +15,9 @@ Rules implemented:
   change; an RRset keeps one TTL.
 * CNAME never coexists with any other data at the same owner name.
 * The apex always holds exactly one SOA.
+* With optional ``continuityChecks``, every critical host must resolve through
+  its unique in-zone CNAME chain to an owner carrying each required address
+  family at the starting snapshot and after every complete change.
 * A failing change — and therefore the whole replay — never produces a partial
   snapshot: each change is applied to a private copy first.
 """
@@ -33,6 +36,8 @@ SERIAL_HALF = 1 << 31
 MAX_TTL = (1 << 31) - 1
 MAX_RECORDS = 5000
 MAX_CHANGES = 64
+MAX_CONTINUITY_CHECKS = 32
+CHECK_ADDRESS_TYPES = ("A", "AAAA")
 
 RTYPES = ("SOA", "A", "AAAA", "CNAME", "TXT")
 RTYPE_ORDER = {rtype: index for index, rtype in enumerate(RTYPES)}
@@ -52,6 +57,9 @@ class ReplayError(Exception):
         *,
         record: int | None = None,
         field: str | None = None,
+        check: str | None = None,
+        reason: str | None = None,
+        index: int | None = None,
     ) -> None:
         super().__init__(message or rule)
         self.code = code
@@ -60,6 +68,9 @@ class ReplayError(Exception):
         self.message = message or rule
         self.record = record
         self.field = field
+        self.check = check
+        self.reason = reason
+        self.index = index
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -68,6 +79,12 @@ class ReplayError(Exception):
             "change": self.change,
             "message": self.message,
         }
+        if self.check is not None:
+            payload["check"] = self.check
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        if self.index is not None:
+            payload["index"] = self.index
         if self.record is not None:
             payload["record"] = self.record
         if self.field is not None:
@@ -325,6 +342,207 @@ def _name_in_zone(name: str, apex: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Continuity checks: critical hosts must resolve at every snapshot
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ContinuityCheck:
+    check_id: str
+    name: str
+    required_types: tuple[str, ...]
+
+
+def parse_continuity_checks(value: Any) -> list[ContinuityCheck]:
+    """Validate the optional ``continuityChecks`` envelope (1–32 entries).
+
+    Each entry carries a unique non-empty ``id`` and a non-empty
+    ``requiredTypes`` list restricted to ``A`` / ``AAAA``. The owner name is
+    normalized here; the in-zone requirement is enforced against the apex in
+    :func:`replay`.
+    """
+
+    if value is None:
+        return []
+    if not isinstance(value, list) or not (1 <= len(value) <= MAX_CONTINUITY_CHECKS):
+        raise ReplayError(
+            "REQUEST_MALFORMED",
+            "continuity_checks_count_out_of_range",
+            field="continuityChecks",
+        )
+
+    checks: list[ContinuityCheck] = []
+    seen_ids: set[str] = set()
+    for position, raw in enumerate(value):
+        if not isinstance(raw, dict):
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_must_be_object",
+                field="continuityChecks",
+                index=position,
+            )
+        check_id = raw.get("id")
+        if not isinstance(check_id, str) or not check_id:
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_id_required",
+                field="id",
+                index=position,
+            )
+        if check_id in seen_ids:
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_id_must_be_unique",
+                field="id",
+                index=position,
+            )
+        seen_ids.add(check_id)
+
+        try:
+            name = normalize_name(raw.get("name"), 0, "name")
+        except ReplayError:
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "continuity_check_invalid_name",
+                field="name",
+                check=check_id,
+                index=position,
+            )
+
+        required = raw.get("requiredTypes")
+        if not isinstance(required, list) or not required:
+            raise ReplayError(
+                "REQUEST_MALFORMED",
+                "required_types_must_be_nonempty_array",
+                field="requiredTypes",
+                check=check_id,
+                index=position,
+            )
+        required_types: list[str] = []
+        for rtype in required:
+            if not isinstance(rtype, str) or rtype.upper() not in CHECK_ADDRESS_TYPES:
+                raise ReplayError(
+                    "REQUEST_MALFORMED",
+                    "required_type_must_be_A_or_AAAA",
+                    field="requiredTypes",
+                    check=check_id,
+                    index=position,
+                )
+            rtype = rtype.upper()
+            # Harmless duplicates (e.g. ["A", "A"]) collapse to one family.
+            if rtype not in required_types:
+                required_types.append(rtype)
+
+        checks.append(ContinuityCheck(check_id, name, tuple(required_types)))
+    return checks
+
+
+def _continuity_failure(
+    check: ContinuityCheck,
+    change: int,
+    reason: str,
+    message: str,
+) -> ReplayError:
+    return ReplayError(
+        "CONTINUITY_CHECK_FAILED",
+        "continuity_check_must_hold_at_every_snapshot",
+        change,
+        message,
+        check=check.check_id,
+        reason=reason,
+    )
+
+
+def _resolve_continuity_check(
+    zone: dict[tuple[str, str], RRset],
+    apex: str,
+    check: ContinuityCheck,
+    change: int,
+) -> dict[str, Any]:
+    """Follow the unique CNAME chain and verify the terminal address records.
+
+    Returns the per-check result fragment (canonical terminal plus one stably
+    sorted address list per required family). Raises ``CONTINUITY_CHECK_FAILED``
+    on loops, dangling/broken chains, out-of-zone terminals or a missing
+    required address family.
+    """
+
+    visited: set[str] = set()
+    current = check.name
+    while True:
+        if current in visited:
+            raise _continuity_failure(
+                check,
+                change,
+                "cname_chain_loop",
+                f"CNAME chain for check {check.check_id!r} loops at {current!r}",
+            )
+        visited.add(current)
+
+        cname_rrset = zone.get((current, "CNAME"))
+        if cname_rrset is None:
+            break
+        # Zone invariants already guarantee a single CNAME target per owner;
+        # a multi-target RRSet cannot describe a unique chain.
+        if len(cname_rrset.rdatas) != 1:
+            raise _continuity_failure(
+                check,
+                change,
+                "cname_target_not_unique",
+                f"CNAME chain for check {check.check_id!r} is not unique at {current!r}",
+            )
+        current = next(iter(cname_rrset.rdatas))[0]
+
+    terminal = current
+    if not _name_in_zone(terminal, apex):
+        raise _continuity_failure(
+            check,
+            change,
+            "cname_chain_outside_zone",
+            f"CNAME chain for check {check.check_id!r} ends outside the zone at {terminal!r}",
+        )
+
+    owner_has_data = any(owner == terminal for owner, _ in zone)
+    if not owner_has_data:
+        raise _continuity_failure(
+            check,
+            change,
+            "cname_chain_broken",
+            f"CNAME chain for check {check.check_id!r} dangles at {terminal!r}",
+        )
+
+    addresses: dict[str, list[str]] = {}
+    for rtype in check.required_types:
+        rrset = zone.get((terminal, rtype))
+        if rrset is None or not rrset.rdatas:
+            raise _continuity_failure(
+                check,
+                change,
+                "missing_required_address",
+                f"terminal {terminal!r} lacks required {rtype} records for "
+                f"check {check.check_id!r}",
+            )
+        addresses[rtype] = sorted(rdata[0] for rdata in rrset.rdatas)
+
+    return {
+        "id": check.check_id,
+        "canonicalName": terminal,
+        "addresses": addresses,
+    }
+
+
+def evaluate_continuity(
+    zone: dict[tuple[str, str], RRset],
+    apex: str,
+    checks: list[ContinuityCheck],
+    change: int,
+) -> list[dict[str, Any]]:
+    return [
+        _resolve_continuity_check(zone, apex, check, change) for check in checks
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -345,6 +563,7 @@ def replay(payload: Any) -> dict[str, Any]:
             "changes_count_out_of_range",
             field="changes",
         )
+    continuity_checks = parse_continuity_checks(payload.get("continuityChecks"))
 
     total_records = len(start) + sum(
         len(_records_list(change.get("deletes"), index + 1, "deletes"))
@@ -386,6 +605,18 @@ def replay(payload: Any) -> dict[str, Any]:
             raise ReplayError(
                 "NAME_OUTSIDE_ZONE", "record_name_outside_zone", 0, record=index
             )
+
+    if continuity_checks:
+        for check in continuity_checks:
+            if not _name_in_zone(check.name, apex):
+                raise ReplayError(
+                    "NAME_OUTSIDE_ZONE",
+                    "continuity_check_name_outside_zone",
+                    0,
+                    check=check.check_id,
+                )
+        # The critical hosts must resolve already at the starting snapshot.
+        evaluate_continuity(zone, apex, continuity_checks, 0)
 
     current_serial: int = soa_record.rdata[2]
 
@@ -508,7 +739,18 @@ def replay(payload: Any) -> dict[str, Any]:
         zone = candidate
         current_serial = _soa_serial(zone, apex)
 
-    return build_snapshot(zone, apex, current_serial, len(changes))
+        # Every critical host must still resolve after each complete change.
+        if continuity_checks:
+            check_results = evaluate_continuity(
+                zone, apex, continuity_checks, change_index
+            )
+
+    snapshot = build_snapshot(zone, apex, current_serial, len(changes))
+    if continuity_checks:
+        # The last complete change *is* the final snapshot; its evaluation is
+        # reused so success results match exactly what was just validated.
+        snapshot["continuityChecks"] = check_results
+    return snapshot
 
 
 def _soa_serial(zone: dict[tuple[str, str], RRset], apex: str) -> int:

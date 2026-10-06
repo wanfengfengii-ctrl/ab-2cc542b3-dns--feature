@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # One-shot verification entry point for the Compose "verify" service.
 # Runs unit tests, a build/syntax check, then the HTTP smoke test (which
-# includes 32-bit serial wraparound) against the running API. Reports the
-# overall conclusion via its exit code and then exits.
+# includes 32-bit serial wraparound and continuity-check scenarios) against
+# the running API. Reports the overall conclusion via its exit code and exits.
 set -euo pipefail
 
 echo "==> [1/3] Build check (byte-compile)"

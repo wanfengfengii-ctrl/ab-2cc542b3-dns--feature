@@ -21,7 +21,8 @@ services:
       start_period: 5s
 
   # One-shot verification: runs the build check, full test suite and an HTTP
-  # smoke test (including serial wraparound) against the live API, then exits.
+  # smoke test (serial wraparound plus continuity-check success/failure)
+  # against the live API, then exits.
   # Its container exit code is the verdict: 0 = pass, non-zero = failure.
   verify:
     image: ixfr-replay:latest
